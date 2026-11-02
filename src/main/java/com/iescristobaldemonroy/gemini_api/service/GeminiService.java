@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter;
 
 import javax.net.ssl.HttpsURLConnection;
 import java.io.BufferedReader;
@@ -17,6 +18,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 @Service
 public class GeminiService {
@@ -173,5 +175,92 @@ public class GeminiService {
         } catch (Exception e) {
             return "Error al procesar la estructura JSON: " + e.getMessage();
         }
+    }
+    // ==========================================
+    // MÉTODO STREAMING (Server-Sent Events)
+    // ==========================================
+    public synchronized void enviarMensajeStream(String sessionId, String promptUsuario, java.util.function.Consumer<String> consumidorChunk) throws Exception {
+        List<MensajeHistorial> historial = obtenerHistorialSesion(sessionId);
+
+        // 1. Añadimos el prompt del usuario
+        historial.add(new MensajeHistorial("user", promptUsuario));
+        podarHistorialSiExcedeLimite(historial);
+
+        // 2. Llamada a Google con alt=sse
+        String endpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
+                + modelo + ":streamGenerateContent?alt=sse&key=" + apiKey;
+
+        URL url = new URL(endpoint);
+        HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+        conn.setRequestProperty("x-goog-api-key", apiKey);
+        conn.setConnectTimeout(20000);
+        conn.setReadTimeout(60000);
+        conn.setDoOutput(true);
+
+        // Reutilizamos la misma estructura JSON
+        ObjectNode rootNode = objectMapper.createObjectNode();
+        ArrayNode contentsArray = rootNode.putArray("contents");
+        for (MensajeHistorial m : historial) {
+            ObjectNode content = contentsArray.addObject();
+            content.put("role", m.getRol());
+            ArrayNode parts = content.putArray("parts");
+            ObjectNode part = parts.addObject();
+            part.put("text", m.getTexto());
+        }
+
+        byte[] input = objectMapper.writeValueAsBytes(rootNode);
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(input, 0, input.length);
+        }
+
+        int statusCode = conn.getResponseCode();
+        if (statusCode != 200) {
+            InputStreamReader errReader = new InputStreamReader(conn.getErrorStream(), StandardCharsets.UTF_8);
+            StringBuilder errBody = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(errReader)) {
+                String line;
+                while ((line = br.readLine()) != null) errBody.append(line);
+            }
+            throw new RuntimeException("Error Google Streaming [" + statusCode + "]: " + errBody);
+        }
+
+        StringBuilder textoCompletoAcumulado = new StringBuilder();
+
+        // 3. Lectura continua línea a línea del flujo SSE de Google
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+            String linea;
+            while ((linea = br.readLine()) != null) {
+                if (linea.startsWith("data: ")) {
+                    String jsonChunk = linea.substring(6).trim();
+                    if (!jsonChunk.isEmpty()) {
+                        String fragmentoTexto = extraerTextoDeChunk(jsonChunk);
+                        if (!fragmentoTexto.isEmpty()) {
+                            textoCompletoAcumulado.append(fragmentoTexto);
+                            consumidorChunk.accept(fragmentoTexto);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Guardamos la respuesta entera generada en el historial
+        historial.add(new MensajeHistorial("model", textoCompletoAcumulado.toString()));
+        podarHistorialSiExcedeLimite(historial);
+    }
+
+    private String extraerTextoDeChunk(String json) {
+        try {
+            JsonNode root = objectMapper.readTree(json);
+            JsonNode candidates = root.path("candidates");
+            if (candidates.isArray() && !candidates.isEmpty()) {
+                JsonNode parts = candidates.get(0).path("content").path("parts");
+                if (parts.isArray() && !parts.isEmpty()) {
+                    return parts.get(0).path("text").asText("");
+                }
+            }
+        } catch (Exception ignored) {}
+        return "";
     }
 }

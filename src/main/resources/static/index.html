@@ -265,9 +265,10 @@
     function agregarMensajeBot(markdownTexto) {
         const div = document.createElement('div');
         div.classList.add('message', 'bot-message');
-        div.innerHTML = marked.parse(markdownTexto);
+        div.innerHTML = marked.parse(markdownTexto || '');
         chatMessages.appendChild(div);
         scrollAlFondo();
+        return div;
     }
 
     function mostrarIndicadorCarga() {
@@ -301,32 +302,43 @@
         mostrarIndicadorCarga();
 
         try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 20000); // 20 segundos máximo
-
-            const res = await fetch('/api/chat', {
+            const res = await fetch('/api/chat/stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mensaje: texto }),
-                signal: controller.signal
+                body: JSON.stringify({ mensaje: texto })
             });
-            clearTimeout(timeoutId);
 
-            const data = await res.json();
             removerIndicadorCarga();
 
-            if (res.ok) {
-                agregarMensajeBot(data.respuesta);
-            } else {
-                agregarMensajeBot('**Aviso:** ' + (data.respuesta || 'Error HTTP ' + res.status));
+            if (!res.ok) {
+                const errorTexto = await res.text();
+                agregarMensajeBot('**Aviso:** ' + (errorTexto || 'Error HTTP ' + res.status));
+                return;
             }
+
+            // Creamos la burbuja vacía y recogemos el div devuelto
+            const divBot = agregarMensajeBot('');
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let textoAcumulado = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value, { stream: true });
+                textoAcumulado += chunk;
+
+                // Actualiza el markdown y hace scroll continuo
+                divBot.innerHTML = marked.parse(textoAcumulado);
+                scrollAlFondo();
+            }
+
         } catch (err) {
             removerIndicadorCarga();
-            if (err.name === 'AbortError') {
-                agregarMensajeBot('**Error:** Tiempo de espera agotado. El servidor tardó demasiado en responder.');
-            } else {
-                agregarMensajeBot('**Error:** No se pudo establecer conexión con el backend.');
-            }
+            agregarMensajeBot('**Error:** No se pudo completar la transmisión con el backend.');
+            console.error(err);
         } finally {
             bloquearControles(false);
             mensajeInput.focus();
